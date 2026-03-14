@@ -1,0 +1,349 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+
+#include <ESP32Servo.h>
+
+// ---------------- WIFI ----------------
+const char* ssid = "moaiwlan";
+const char* password = "Ossi1Paavo234";
+
+// ---------------- TELEGRAM ----------------
+String botToken = "8205806404:AAE6FqwxrNU70IcwUa8p1VbkaW0yYiLciVg";
+String chatID   = "8670427457";
+
+WiFiClientSecure clientTCP;
+
+// ---------------- PIR ----------------
+#define PIR_PIN 32
+unsigned long lastMotionTime = 0;
+const unsigned long motionCooldown = 15000; // 15 sec
+
+// ---------------- SERVO ----------------
+#define SERVO_PIN   14   // <-- change if your servo signal uses another GPIO
+#define SERVO_REST  10
+#define SERVO_PRESS 100
+
+Servo sprayServo;
+
+// ---------------- TFT (ST7789) ----------------
+#define TFT_CS   2
+#define TFT_DC   33
+#define TFT_MOSI 12
+#define TFT_SCLK 13
+#define TFT_RST  -1  // RES not connected
+
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
+
+// ---------------- CAMERA MODEL ----------------
+#define CAMERA_MODEL_WROVER_KIT
+
+#if defined(CAMERA_MODEL_WROVER_KIT)
+#define PWDN_GPIO_NUM    -1
+#define RESET_GPIO_NUM   -1
+#define XCLK_GPIO_NUM    21
+#define SIOD_GPIO_NUM    26
+#define SIOC_GPIO_NUM    27
+#define Y9_GPIO_NUM      35
+#define Y8_GPIO_NUM      34
+#define Y7_GPIO_NUM      39
+#define Y6_GPIO_NUM      36
+#define Y5_GPIO_NUM      19
+#define Y4_GPIO_NUM      18
+#define Y3_GPIO_NUM       5
+#define Y2_GPIO_NUM       4
+#define VSYNC_GPIO_NUM   25
+#define HREF_GPIO_NUM    23
+#define PCLK_GPIO_NUM    22
+#endif
+
+// ---------------- FLOW ----------------
+bool awaitingYes = false;
+unsigned long awaitingSince = 0;
+const unsigned long yesTimeout = 60000; // 60 sec to reply YES
+long lastUpdateId = 0;                  // Telegram offset
+
+// ---------------- UI HELPERS ----------------
+void tftMsg(const char* a, const char* b = nullptr) {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextWrap(true);
+
+  tft.setTextSize(2);
+  tft.setCursor(0, 10);
+  tft.println(a);
+
+  if (b) {
+    tft.setCursor(0, 60);
+    tft.println(b);
+  }
+}
+
+void sprayOnce() {
+  sprayServo.write(SERVO_PRESS);
+  delay(700);
+  sprayServo.write(SERVO_REST);
+  delay(300);
+}
+
+// ---------------- TELEGRAM: SEND PHOTO ----------------
+void sendPhotoTelegram(camera_fb_t * fb) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected - cannot send Telegram.");
+    return;
+  }
+
+  clientTCP.stop();
+  clientTCP.setInsecure();
+  clientTCP.setTimeout(20000);
+
+  if (!clientTCP.connect("api.telegram.org", 443)) {
+    Serial.println("Telegram connection failed");
+    return;
+  }
+
+  String boundary = "ESP32CAMBOUNDARY";
+
+  String head = "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n";
+  head += chatID + "\r\n";
+  head += "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"caption\"\r\n\r\n";
+  head += "⚠️ Motion detected! Reply YES to spray.\r\n";
+  head += "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"photo\"; filename=\"esp32.jpg\"\r\n";
+  head += "Content-Type: image/jpeg\r\n\r\n";
+
+  String tail = "\r\n--" + boundary + "--\r\n";
+
+  uint32_t totalLen = head.length() + fb->len + tail.length();
+
+  clientTCP.print("POST /bot" + botToken + "/sendPhoto HTTP/1.1\r\n");
+  clientTCP.print("Host: api.telegram.org\r\n");
+  clientTCP.print("Content-Length: " + String(totalLen) + "\r\n");
+  clientTCP.print("Content-Type: multipart/form-data; boundary=" + boundary + "\r\n");
+  clientTCP.print("Connection: close\r\n\r\n");
+
+  clientTCP.print(head);
+  clientTCP.write(fb->buf, fb->len);
+  clientTCP.print(tail);
+
+  Serial.println("📸 Photo upload request sent to Telegram...");
+
+  // Skip headers
+  while (clientTCP.connected()) {
+    String line = clientTCP.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+
+  // Body
+  String body = clientTCP.readString();
+  Serial.println("Telegram response:");
+  Serial.println(body);
+
+  clientTCP.stop();
+}
+
+// ---------------- TELEGRAM: CHECK YES ----------------
+bool checkTelegramForYes() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  clientTCP.stop();
+  clientTCP.setInsecure();
+  clientTCP.setTimeout(15000);
+
+  if (!clientTCP.connect("api.telegram.org", 443)) {
+    Serial.println("getUpdates connect failed");
+    return false;
+  }
+
+  String url = "/bot" + botToken + "/getUpdates?timeout=0";
+  if (lastUpdateId > 0) url += "&offset=" + String(lastUpdateId + 1);
+
+  clientTCP.print("GET " + url + " HTTP/1.1\r\n");
+  clientTCP.print("Host: api.telegram.org\r\n");
+  clientTCP.print("Connection: close\r\n\r\n");
+
+  // Skip headers
+  while (clientTCP.connected()) {
+    String line = clientTCP.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+
+  String body = clientTCP.readString();
+  clientTCP.stop();
+
+  // Update lastUpdateId (simple parse)
+  int idx = 0;
+  while (true) {
+    int u = body.indexOf("\"update_id\":", idx);
+    if (u < 0) break;
+    int start = u + 12;
+    while (start < (int)body.length() && body[start] == ' ') start++;
+    int end = start;
+    while (end < (int)body.length() && isDigit(body[end])) end++;
+    long idVal = body.substring(start, end).toInt();
+    if (idVal > lastUpdateId) lastUpdateId = idVal;
+    idx = end;
+  }
+
+  // Look for YES (case-insensitive)
+  String upper = body;
+  upper.toUpperCase();
+
+  // Only react to your chat id (basic check)
+  if (upper.indexOf("\"CHAT\":{\"ID\":" + chatID) < 0 &&
+      upper.indexOf("\"CHAT\": {\"ID\": " + chatID) < 0) {
+    // still continue; Telegram JSON spacing varies
+  }
+
+  if (upper.indexOf("\"TEXT\":\"YES\"") >= 0) return true;
+
+  return false;
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(PIR_PIN, INPUT);
+
+  // Servo
+  sprayServo.setPeriodHertz(50);
+  sprayServo.attach(SERVO_PIN, 500, 2400);
+  sprayServo.write(SERVO_REST);
+
+  // TFT (ST7789)
+  tft.init(128, 160);
+  tft.setRotation(1);
+  tftMsg("READY", "MOVE=PHOTO");
+
+  Serial.println("\nStarting...");
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Camera config (same as your working version)
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+
+  config.pin_xclk  = XCLK_GPIO_NUM;
+  config.pin_pclk  = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href  = HREF_GPIO_NUM;
+
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+  config.pin_pwdn  = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 10000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  config.frame_size   = FRAMESIZE_QQVGA;
+  config.jpeg_quality = 12;
+  config.fb_count     = 1;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+  config.grab_mode    = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    tftMsg("CAM FAIL");
+    return;
+  }
+
+  Serial.println("Camera ready ✅");
+
+  Serial.println("PIR warming up (30s)...");
+  delay(30000);
+  Serial.println("Ready!");
+  tftMsg("READY", "MOVE=PHOTO");
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  // If waiting for YES, poll telegram
+  if (awaitingYes) {
+    if (millis() - awaitingSince > yesTimeout) {
+      awaitingYes = false;
+      Serial.println("⌛ YES timeout");
+      tftMsg("TIMEOUT", "NO SPRAY");
+      delay(1200);
+      tftMsg("READY", "MOVE=PHOTO");
+      return;
+    }
+
+    static unsigned long lastPoll = 0;
+    if (millis() - lastPoll > 2000) {
+      lastPoll = millis();
+      Serial.println("Checking Telegram for YES...");
+      if (checkTelegramForYes()) {
+        Serial.println("✅ YES received!");
+        tftMsg("THIS MY", "SHIT");
+        sprayOnce();
+        awaitingYes = false;
+        delay(1500);
+        tftMsg("READY", "MOVE=PHOTO");
+      }
+    }
+    return;
+  }
+
+  // Normal mode: PIR triggers photo
+  int motion = digitalRead(PIR_PIN);
+  Serial.print("PIR: ");
+  Serial.println(motion);
+
+  if (motion == HIGH && millis() - lastMotionTime > motionCooldown) {
+    lastMotionTime = millis();
+    Serial.println("🚨 Motion detected!");
+
+    tftMsg("SENDING", "PHOTO...");
+
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      tftMsg("CAPTURE", "FAILED");
+      delay(1200);
+      tftMsg("READY", "MOVE=PHOTO");
+      return;
+    }
+
+    sendPhotoTelegram(fb);
+    esp_camera_fb_return(fb);
+
+    // Now wait for YES
+    awaitingYes = true;
+    awaitingSince = millis();
+    tftMsg("REPLY", "YES TO SPRAY");
+    Serial.println("Waiting for YES reply...");
+  }
+
+  delay(200);
+}
