@@ -1,0 +1,61 @@
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);
+
+#define GPS_RX 14   // ESP32 receives from GPS TX
+#define GPS_TX 12   // ESP32 sends to GPS RX
+
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  Serial.println("GPS full UART test (RX 14, TX 12)...");
+}
+
+void loop() {
+  while (gpsSerial.available()) {
+    char c = gpsSerial.read();
+    gps.encode(c);
+  }
+
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 2000) {
+    lastPrint = millis();
+
+    Serial.println("\n--- Parsed Data ---");
+
+    Serial.print("Location valid: ");
+    Serial.println(gps.location.isValid() ? "YES" : "NO");
+
+    Serial.print("Satellites: ");
+    Serial.println(gps.satellites.isValid() ? gps.satellites.value() : 0);
+
+    if (gps.location.isValid()) {
+      Serial.print("Latitude: ");
+      Serial.println(gps.location.lat(), 6);
+
+      Serial.print("Longitude: ");
+      Serial.println(gps.location.lng(), 6);
+    }
+
+    if (gps.date.isValid() && gps.time.isValid()) {
+      Serial.print("Date: ");
+      Serial.print(gps.date.day());
+      Serial.print("/");
+      Serial.print(gps.date.month());
+      Serial.print("/");
+      Serial.println(gps.date.year());
+
+      Serial.print("Time (UTC): ");
+      Serial.print(gps.time.hour());
+      Serial.print(":");
+      Serial.print(gps.time.minute());
+      Serial.print(":");
+      Serial.println(gps.time.second());
+    }
+
+    Serial.println("--------------------");
+  }
+}
